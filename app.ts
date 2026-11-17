@@ -32,6 +32,9 @@ export function createApp(store: Store, token: string): Server {
   return server;
 }
 
+/** One shared empty query: no handler ever mutates `query` (only `.get()`), so requests with no `?` share this instead of allocating a fresh URLSearchParams each. */
+const EMPTY_QUERY = new URLSearchParams();
+
 async function handleRequest(store: Store, token: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requestId = nextRequestId();
   res.setHeader('X-GitHub-Request-Id', requestId);
@@ -41,7 +44,7 @@ async function handleRequest(store: Store, token: string, req: IncomingMessage, 
   const rawUrl = req.url ?? '/';
   const qIndex = rawUrl.indexOf('?');
   const pathname = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
-  const query = new URLSearchParams(qIndex < 0 ? '' : rawUrl.slice(qIndex + 1));
+  const query = qIndex < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(qIndex + 1));
   const segments = pathname.split('/').filter((part) => part !== '');
   const method = req.method ?? 'GET';
   const base = requestOrigin(req);

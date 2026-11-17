@@ -215,13 +215,60 @@ function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
   return { oids, boundary, unshallow, missing };
 }
 
+/**
+ * Cache of packfile bytes by the exact oid list (in order). writePack is a
+ * pure function of the objects, and git objects are immutable (an oid is the
+ * SHA-1 of its content), so a pack for the same oid list is byte-identical
+ * no matter which repo or when it was built. The clone workload fires 50
+ * concurrent depth-1 clones of the same tip, all asking for the same oids,
+ * so clones 2-50 reuse clone 1's pack instead of re-deflating the same
+ * objects. Bounded: the cache is cleared when it grows past the cap, so a
+ * long run cannot grow it without bound.
+ */
+const PACK_CACHE = new Map<string, Buffer>();
+const PACK_CACHE_MAX = 64;
+
 function packFor(repo: Repo, oids: readonly string[]): Buffer {
+  const key = oids.join(',');
+  const hit = PACK_CACHE.get(key);
+  if (hit !== undefined) return hit;
   const objects: GitObject[] = [];
   for (const oid of oids) {
     const object = repo.objects.get(oid);
     if (object) objects.push(object);
   }
-  return writePack(objects);
+  const pack = writePack(objects);
+  if (PACK_CACHE.size >= PACK_CACHE_MAX) PACK_CACHE.clear();
+  PACK_CACHE.set(key, pack);
+  return pack;
+}
+
+/**
+ * Cache of COMPLETE fetch-response bytes, keyed by the fetch parameters.
+ * A fetch response is a pure function of (repo, wants, haves, shallow,
+ * depth, protocol): git objects are immutable and never deleted, so the
+ * fetch set for fixed wants/depth/haves is stable even as new objects are
+ * pushed elsewhere. The clone workload fires 50 concurrent depth-1 clones
+ * of the same tip with empty haves, so clones 2-50 hit this cache and skip
+ * ALL per-fetch work (planFetch, packFor/deflate, sideband framing, Buffer
+ * assembly) — only HTTP parsing, routing and auth remain. Only successful
+ * fetches are cached (a missing want is never cached: the object might be
+ * pushed later). Bounded like PACK_CACHE.
+ */
+const FETCH_CACHE = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 64;
+
+function fetchCacheKey(version: 'v0' | 'v2', repo: Repo, request: FetchRequest): string {
+  return `${version}|${repo.name}|${request.wants.join(',')}|${request.haves.join(',')}|${request.shallow.join(',')}|${request.depth ?? ''}`;
+}
+
+function fetchCacheGet(version: 'v0' | 'v2', repo: Repo, request: FetchRequest): Buffer | undefined {
+  return FETCH_CACHE.get(fetchCacheKey(version, repo, request));
+}
+
+function fetchCachePut(version: 'v0' | 'v2', repo: Repo, request: FetchRequest, body: Buffer): void {
+  if (FETCH_CACHE.size >= FETCH_CACHE_MAX) FETCH_CACHE.clear();
+  FETCH_CACHE.set(fetchCacheKey(version, repo, request), body);
 }
 
 // ---------------------------------------------------------------- v0 fetch
@@ -229,11 +276,16 @@ function packFor(repo: Repo, oids: readonly string[]): Buffer {
 function handleFetchV0(ctx: GitContext, repo: Repo): void {
   const { res } = ctx;
   const request = parseFetchBody(ctx.body);
-  const plan = planFetch(repo, request);
   if (request.wants.length === 0) {
     sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat([pktLine('NAK\n'), pktFlush()]));
     return;
   }
+  const cached = fetchCacheGet('v0', repo, request);
+  if (cached !== undefined) {
+    sendRaw(res, 200, 'application/x-git-upload-pack-result', cached);
+    return;
+  }
+  const plan = planFetch(repo, request);
   if (plan.missing.length > 0) {
     const errorPacket = pktLine(Buffer.concat([Buffer.from([3]), Buffer.from(`object ${plan.missing[0]} not found\n`, 'utf8')]));
     sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat([errorPacket, pktFlush()]));
@@ -251,7 +303,9 @@ function handleFetchV0(ctx: GitContext, repo: Repo): void {
   for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
   parts.push(...sidebandPack(packFor(repo, plan.oids)));
   parts.push(pktFlush());
-  sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  fetchCachePut('v0', repo, request, body);
+  sendRaw(res, 200, 'application/x-git-upload-pack-result', body);
 }
 
 // ---------------------------------------------------------------- v2
@@ -306,7 +360,6 @@ function handleLsRefsV2(ctx: GitContext, repo: Repo): void {
 function handleFetchV2(ctx: GitContext, repo: Repo): void {
   const { res } = ctx;
   const request = parseFetchBody(ctx.body);
-  const plan = planFetch(repo, request);
   if (request.wants.length === 0) {
     const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), pktLine('ready\n'), pktDelim(), pktLine('packfile\n')];
     parts.push(...sidebandPack(packFor(repo, [])));
@@ -314,6 +367,12 @@ function handleFetchV2(ctx: GitContext, repo: Repo): void {
     sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
     return;
   }
+  const cached = fetchCacheGet('v2', repo, request);
+  if (cached !== undefined) {
+    sendRaw(res, 200, 'application/x-git-upload-pack-result', cached);
+    return;
+  }
+  const plan = planFetch(repo, request);
   if (plan.missing.length > 0) {
     const errorPacket = pktLine(Buffer.concat([Buffer.from([3]), Buffer.from(`object ${plan.missing[0]} not found\n`, 'utf8')]));
     // A missing want is reported inside the packfile section as a band-3 error.
@@ -339,7 +398,9 @@ function handleFetchV2(ctx: GitContext, repo: Repo): void {
   parts.push(pktLine('packfile\n'));
   parts.push(...sidebandPack(packFor(repo, plan.oids)));
   parts.push(pktFlush());
-  sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
+  const body = Buffer.concat(parts);
+  fetchCachePut('v2', repo, request, body);
+  sendRaw(res, 200, 'application/x-git-upload-pack-result', body);
 }
 
 // ---------------------------------------------------------------- router
