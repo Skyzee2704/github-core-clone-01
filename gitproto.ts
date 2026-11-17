@@ -18,6 +18,7 @@ import {
   collectHeld,
   collectReachable,
   collectShallow,
+  isAncestor,
   parseCommit,
   parsePktLines,
   parseTag,
@@ -26,7 +27,6 @@ import {
   pktDelim,
   pktFlush,
   pktLine,
-  putObject,
   readPack,
   walkCommits,
   writePack,
@@ -101,8 +101,8 @@ function advertisementV0(service: 'git-upload-pack' | 'git-receive-pack', repo: 
   return Buffer.concat(parts);
 }
 
-/** The v2 capability advertisement for upload-pack. */
-function advertisementV2(): Buffer {
+/** The v2 capability advertisement for upload-pack. Static: built once, reused for every info/refs. */
+const ADVERTISEMENT_V2: Buffer = (() => {
   const lines = [
     'version 2\n',
     'ls-refs=unborn\n',
@@ -112,6 +112,11 @@ function advertisementV2(): Buffer {
     `agent=${SERVER_AGENT}\n`,
   ];
   return Buffer.concat([...lines.map((line) => pktLine(line)), pktFlush()]);
+})();
+
+/** The v2 capability advertisement for upload-pack. */
+function advertisementV2(): Buffer {
+  return ADVERTISEMENT_V2;
 }
 
 const SIDEBAND_MAX_DATA = 65515; // pkt-line max (65520) minus length (4) minus band byte (1)
@@ -431,7 +436,11 @@ function handleReceivePack(ctx: GitContext, repo: Repo): void {
   if (packBytes.length > 0) {
     try {
       const objects = readPack(packBytes, (oid) => repo.objects.get(oid));
-      for (const object of objects.values()) putObject(repo.objects, object.type, object.data);
+      // readPack already keyed every object by its SHA-1; store them
+      // directly instead of re-hashing each one through putObject.
+      for (const [oid, object] of objects) {
+        if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+      }
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpacker error';
@@ -482,9 +491,10 @@ function handleReceivePack(ctx: GitContext, repo: Repo): void {
       continue;
     }
     // A fast-forward update: the new tip must descend from the current tip.
+    // isAncestor stops at the first hit, so a push onto a long linear chain
+    // costs one parent lookup, not a full-history walk.
     if (!isTag && command.newOid !== current) {
-      const ancestors = walkCommits(repo.objects, command.newOid);
-      if (!ancestors.includes(current)) {
+      if (!isAncestor(repo.objects, command.newOid, current)) {
         reportLines.push(`ng ${command.ref} non-fast-forward\n`);
         continue;
       }

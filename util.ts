@@ -19,6 +19,16 @@ export function sendJson(
   extraHeaders: Record<string, string> = {},
 ): void {
   const text = JSON.stringify(body);
+  sendJsonText(res, status, text, extraHeaders);
+}
+
+/** Send an already-stringified JSON body (a memoized reply: no re-stringify). */
+export function sendJsonText(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  extraHeaders: Record<string, string> = {},
+): void {
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(text),

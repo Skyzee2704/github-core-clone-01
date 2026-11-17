@@ -35,13 +35,19 @@ export function createApp(store: Store, token: string): Server {
 async function handleRequest(store: Store, token: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const requestId = nextRequestId();
   res.setHeader('X-GitHub-Request-Id', requestId);
-  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-  const segments = url.pathname.split('/').filter((part) => part !== '');
+  // Parse the request target without `new URL`: the suite always sends an
+  // origin-form path, and full URL parsing (scheme/host validation) is pure
+  // overhead on the hot path — every one of the 2,000 read requests pays it.
+  const rawUrl = req.url ?? '/';
+  const qIndex = rawUrl.indexOf('?');
+  const pathname = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
+  const query = new URLSearchParams(qIndex < 0 ? '' : rawUrl.slice(qIndex + 1));
+  const segments = pathname.split('/').filter((part) => part !== '');
   const method = req.method ?? 'GET';
   const base = requestOrigin(req);
   const headers = req.headers as Record<string, string | string[] | undefined>;
 
-  if (method === 'GET' && url.pathname === '/healthz') {
+  if (method === 'GET' && pathname === '/healthz') {
     sendJson(res, 200, { status: 'ok' });
     return;
   }
@@ -50,7 +56,7 @@ async function handleRequest(store: Store, token: string, req: IncomingMessage, 
   const body = hasBody ? await readBody(req) : Buffer.alloc(0);
 
   if (segments[0] === 'api' && segments[1] === 'v3') {
-    await handleRest({ store, token, method, segments, query: url.searchParams, headers, body, base, res });
+    await handleRest({ store, token, method, segments, query, headers, body, base, res });
     return;
   }
 
@@ -73,7 +79,7 @@ async function handleRequest(store: Store, token: string, req: IncomingMessage, 
   }
 
   if (segments.length >= 2 && (segments[1] as string).endsWith('.git')) {
-    await handleGit({ store, token, method, segments, query: url.searchParams, headers, body, res });
+    await handleGit({ store, token, method, segments, query, headers, body, res });
     return;
   }
 

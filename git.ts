@@ -327,9 +327,20 @@ function resolvePackBase(
 
 /** Inflate exactly one zlib stream starting at `offset`; return its bytes and the next offset. */
 function inflateOne(pack: Buffer, offset: number): { data: Buffer; next: number } {
-  // Node's inflateSync ignores bytes after the stream's end and throws on a
-  // truncated stream, so the stream's true end is the smallest end position
-  // that inflates cleanly — found by binary search.
+  // inflateSync stops at the end of the first zlib stream and ignores the
+  // trailing bytes, so one call yields the object. Its consumed length is
+  // recovered without a search: deflateSync is deterministic for the same
+  // input and level, so re-deflating the object reproduces the exact bytes
+  // the client wrote; the match is verified, and a mismatch falls back to
+  // the binary search below (which never depends on that assumption).
+  const data = inflateSync(pack.subarray(offset, pack.length - 20));
+  const deflated = deflateSync(data);
+  const end = offset + deflated.length;
+  if (end <= pack.length - 20 && pack.subarray(offset, end).equals(deflated)) {
+    return { data, next: end };
+  }
+  // Fallback: the stream's true end is the smallest end position that
+  // inflates cleanly — found by binary search.
   let low = offset + 2;
   let high = pack.length - 20; // leave room for the trailer
   let found: Buffer | null = null;
@@ -442,6 +453,31 @@ export function walkCommits(objects: Map<string, GitObject>, tip: string): strin
   };
   visit(tip);
   return out;
+}
+
+/**
+ * Whether `ancestor` is reachable from `descendant` by following parents.
+ * Stops at the first hit (unlike walkCommits, which lists the whole history),
+ * so a fast-forward check on a long linear chain is one parent lookup instead
+ * of a full-history walk: the push workload's 200-commit chain made every
+ * push re-walk all of history (O(n^2) over the run).
+ */
+export function isAncestor(objects: Map<string, GitObject>, descendant: string, ancestor: string): boolean {
+  if (descendant === ancestor) return true;
+  const seen = new Set<string>();
+  const queue: string[] = [descendant];
+  while (queue.length > 0) {
+    const oid = queue.pop() as string;
+    if (seen.has(oid)) continue;
+    const object = objects.get(oid);
+    if (!object || object.type !== 'commit') continue;
+    seen.add(oid);
+    for (const parent of parseCommit(object.data).parents) {
+      if (parent === ancestor) return true;
+      queue.push(parent);
+    }
+  }
+  return false;
 }
 
 /**

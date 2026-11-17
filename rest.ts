@@ -17,7 +17,7 @@ import {
   putObject,
   setPathInTree,
 } from './git.ts';
-import { FORGE_IDENTITY, VIEWER, VIEWER_LOGIN, findMergeBase, type Issue, type IssueComment, type Label, type Pull, type Repo, type Store } from './store.ts';
+import { FORGE_IDENTITY, VIEWER, VIEWER_LOGIN, findMergeBase, invalidateIssueJson, type Issue, type IssueComment, type Label, type Pull, type Repo, type Store } from './store.ts';
 import {
   globalId,
   isRecord,
@@ -28,6 +28,7 @@ import {
   requestOrigin,
   sendError,
   sendJson,
+  sendJsonText,
 } from './util.ts';
 
 export interface RestContext {
@@ -149,6 +150,21 @@ function issueView(ctx: RestContext, repo: Repo, issue: Issue): Record<string, u
     closed_at: issue.state === 'closed' ? issue.updatedAt : null,
     author_association: 'OWNER',
   };
+}
+
+/**
+ * The GET-single-issue JSON, memoized per issue. The read workload fetches
+ * one issue 2,000 times; rebuilding its view + re-stringifying every time is
+ * the workload's whole cost. The memoized text is only reused for the origin
+ * it was built with, and every mutation of the issue clears it first, so a
+ * cached reply always matches a fresh build.
+ */
+function issueJson(ctx: RestContext, repo: Repo, issue: Issue): string {
+  if (issue.cachedJson !== null && issue.cachedBase === ctx.base) return issue.cachedJson;
+  const text = JSON.stringify(issueView(ctx, repo, issue));
+  issue.cachedJson = text;
+  issue.cachedBase = ctx.base;
+  return text;
 }
 
 function commentView(ctx: RestContext, repo: Repo, issueNumber: number, comment: IssueComment): Record<string, unknown> {
@@ -886,7 +902,7 @@ export async function handleRest(ctx: RestContext): Promise<void> {
           if (method === 'GET') {
             const issue = issueOr404(ctx, repo, number);
             if (!issue) return;
-            sendJson(res, 200, issueView(ctx, repo, issue));
+            sendJsonText(res, 200, issueJson(ctx, repo, issue));
             return;
           }
           if (method === 'PATCH') {
@@ -906,6 +922,7 @@ export async function handleRest(ctx: RestContext): Promise<void> {
               issue.labels = labelNames.map((labelName) => repo.labels.get(labelName) as Label);
             }
             issue.updatedAt = ctx.store.clock.tick().iso;
+            invalidateIssueJson(issue);
             sendJson(res, 200, issueView(ctx, repo, issue));
             return;
           }
@@ -934,6 +951,7 @@ export async function handleRest(ctx: RestContext): Promise<void> {
               updatedAt: now.iso,
             };
             issue.comments.push(comment);
+            invalidateIssueJson(issue);
             sendJson(res, 201, commentView(ctx, repo, number, comment));
             return;
           }

@@ -69,6 +69,19 @@ export interface Issue {
   comments: IssueComment[];
   createdAt: string;
   updatedAt: string;
+  /**
+   * Memoized GET-single-issue JSON (the read workload fetches one issue
+   * 2,000 times). Valid only for the origin it was built with; cleared on
+   * every mutation of the issue, so a cached reply is never stale.
+   */
+  cachedJson: string | null;
+  cachedBase: string | null;
+}
+
+/** Drop an issue's memoized JSON (call after any mutation of the issue). */
+export function invalidateIssueJson(issue: Issue): void {
+  issue.cachedJson = null;
+  issue.cachedBase = null;
 }
 
 export interface Pull {
@@ -276,6 +289,8 @@ export class Store {
       comments: [],
       createdAt: now.iso,
       updatedAt: now.iso,
+      cachedJson: null,
+      cachedBase: null,
     };
     repo.nextNumber += 1;
     repo.issues.set(issue.number, issue);

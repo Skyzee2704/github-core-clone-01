@@ -11,7 +11,7 @@
 import type { ServerResponse } from 'node:http';
 import { countLineChanges, diffTrees, parseCommit } from './git.ts';
 import { executeMerge, findMergeConflicts, refreshPull } from './rest.ts';
-import { VIEWER, VIEWER_LOGIN, type Issue, type IssueComment, type Pull, type Repo, type Store } from './store.ts';
+import { VIEWER, VIEWER_LOGIN, invalidateIssueJson, type Issue, type IssueComment, type Pull, type Repo, type Store } from './store.ts';
 import { decodeCursor, encodeCursor, globalId, isRecord, parseGlobalId, parseJsonBody, sendError, sendJson } from './util.ts';
 
 // ---------------------------------------------------------------- schema
@@ -733,6 +733,7 @@ function resolveField(typeName: string, node: GqlNode, field: string, args: Reco
         }
         found.issue.state = 'closed';
         found.issue.updatedAt = store.clock.tick().iso;
+        invalidateIssueJson(found.issue);
         return { __typename: 'CloseIssuePayload', issue: issueNode(found.repo, found.issue), clientMutationId: (input.clientMutationId as string | null) ?? null };
       }
       if (field === 'createPullRequest') {
@@ -798,6 +799,7 @@ function resolveField(typeName: string, node: GqlNode, field: string, args: Reco
         const now = store.clock.tick();
         const comment: IssueComment = { id: store.nextId(), body, user: VIEWER_LOGIN, createdAt: now.iso, updatedAt: now.iso };
         found.issue.comments.push(comment);
+        invalidateIssueJson(found.issue);
         const node = commentNode(found.repo, found.issue.number, comment);
         return {
           __typename: 'AddCommentPayload',
